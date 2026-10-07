@@ -1,0 +1,144 @@
+varnishtest "memstore: allow_missing tolerates an absent file at load, but nothing else"
+
+# Nothing is created up front: all three files are missing at vcl.load.
+
+varnish v1 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		new cs = memstore.cidr_set("${tmpdir}/late.cidrs", allow_missing = true);
+		new kv = memstore.kv_store("${tmpdir}/late.kv", allow_missing = true);
+		new re = memstore.regex_set("${tmpdir}/late.re", allow_missing = true);
+	}
+
+	sub vcl_recv {
+		if (req.url == "/reload") {
+			set req.http.cidr-ok = cs.reload();
+			set req.http.kv-ok   = kv.reload();
+			set req.http.re-ok   = re.reload();
+		}
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.cidr-reloaded = req.http.cidr-ok;
+		set resp.http.kv-reloaded   = req.http.kv-ok;
+		set resp.http.re-reloaded   = req.http.re-ok;
+
+		set resp.http.cidr-count = cs.count();
+		set resp.http.cidr-hit   = cs.contains_str("10.1.2.3");
+
+		set resp.http.kv-count   = kv.count();
+		set resp.http.kv-a       = kv.get("a");
+		set resp.http.kv-exists  = kv.exists("a");
+
+		set resp.http.re-count   = re.count();
+		set resp.http.re-hit     = re.matches("curl/8.5.0");
+	}
+} -start
+
+# --- The VCL loaded, and every store is empty and misses everything -----------
+client c1 {
+	txreq -url "/"
+	rxresp
+	expect resp.http.cidr-count == "0"
+	expect resp.http.cidr-hit   == "false"
+	expect resp.http.kv-count   == "0"
+	expect resp.http.kv-a       == ""
+	expect resp.http.kv-exists  == "false"
+	expect resp.http.re-count   == "0"
+	expect resp.http.re-hit     == "false"
+} -run
+
+# Starting empty is opted into, but it is not silent.
+logexpect l1 -v v1 -d 1 -g raw {
+	expect * * Error "does not exist, starting empty"
+} -run
+
+# --- The files show up, and reload() picks them up ---------------------------
+shell {
+	printf '%s\n' '10.0.0.0/8' > ${tmpdir}/late.cidrs
+	printf '%s\n' 'a=now-here' > ${tmpdir}/late.kv
+	printf '%s\n' '^curl/' > ${tmpdir}/late.re
+}
+
+client c2 {
+	txreq -url "/reload"
+	rxresp
+	expect resp.http.cidr-reloaded == "true"
+	expect resp.http.kv-reloaded   == "true"
+	expect resp.http.re-reloaded   == "true"
+
+	expect resp.http.cidr-count == "1"
+	expect resp.http.cidr-hit   == "true"
+	expect resp.http.kv-count   == "1"
+	expect resp.http.kv-a       == "now-here"
+	expect resp.http.re-count   == "1"
+	expect resp.http.re-hit     == "true"
+} -run
+
+# --- allow_missing covers the cold start only, not reload --------------------
+shell {
+	rm -f ${tmpdir}/late.cidrs ${tmpdir}/late.kv ${tmpdir}/late.re
+}
+
+client c3 {
+	txreq -url "/reload"
+	rxresp
+	# A vanished file is a failed reload, not a wipe -- even though the objects
+	# were constructed with allow_missing.
+	expect resp.http.cidr-reloaded == "false"
+	expect resp.http.kv-reloaded   == "false"
+	expect resp.http.re-reloaded   == "false"
+
+	expect resp.http.cidr-count == "1"
+	expect resp.http.cidr-hit   == "true"
+	expect resp.http.kv-a       == "now-here"
+	expect resp.http.re-count   == "1"
+} -run
+
+# ---------------------------------------------------------------------------
+# allow_missing excuses an absent file and nothing else: a file that is there
+# but broken still fails vcl.load.
+# ---------------------------------------------------------------------------
+
+shell {
+	printf '%s\n' '10.0.0.0/8' 'garbage-not-a-cidr' > ${tmpdir}/broken.cidrs
+	printf '%s\n' 'a=1' 'line without separator'    > ${tmpdir}/broken.kv
+	printf '%s\n' '^ok' '[unclosed'                 > ${tmpdir}/broken.re
+}
+
+varnish v1 -errvcl "invalid IP address" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.cidr_set("${tmpdir}/broken.cidrs", allow_missing = true);
+	}
+}
+
+varnish v1 -errvcl "missing separator" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.kv_store("${tmpdir}/broken.kv", allow_missing = true);
+	}
+}
+
+varnish v1 -errvcl "invalid pattern" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.regex_set("${tmpdir}/broken.re", allow_missing = true);
+	}
+}
+
+# A directory is not a missing file: it is an unreadable one, and stays fatal.
+varnish v1 -errvcl "cannot read" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.cidr_set("${tmpdir}", allow_missing = true);
+	}
+}

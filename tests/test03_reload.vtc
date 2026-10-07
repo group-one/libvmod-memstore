@@ -1,0 +1,157 @@
+varnishtest "memstore: reload swaps in new content, and keeps the old on failure"
+
+shell {
+	printf '%s\n' '192.168.1.0/24' > ${tmpdir}/reload.cidrs
+	printf '%s\n' 'a=original' > ${tmpdir}/reload.kv
+	printf '%s\n' '^original/' > ${tmpdir}/reload.re
+}
+
+varnish v1 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		new cs = memstore.cidr_set("${tmpdir}/reload.cidrs");
+		new kv = memstore.kv_store("${tmpdir}/reload.kv");
+		new re = memstore.regex_set("${tmpdir}/reload.re");
+	}
+
+	sub vcl_recv {
+		if (req.url == "/reload") {
+			set req.http.cidr-ok = cs.reload();
+			set req.http.kv-ok   = kv.reload();
+			set req.http.re-ok   = re.reload();
+		}
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.cidr-reloaded = req.http.cidr-ok;
+		set resp.http.kv-reloaded   = req.http.kv-ok;
+		set resp.http.re-reloaded   = req.http.re-ok;
+
+		set resp.http.cidr-count = cs.count();
+		set resp.http.old-net    = cs.contains_str("192.168.1.5");
+		set resp.http.new-net    = cs.contains_str("10.1.2.3");
+
+		set resp.http.kv-count   = kv.count();
+		set resp.http.kv-a       = kv.get("a");
+		set resp.http.kv-b       = kv.get("b");
+		set resp.http.kv-runtime = kv.get("runtime-only");
+
+		set resp.http.re-count   = re.count();
+		set resp.http.re-old     = re.matches("original/ua");
+		set resp.http.re-new     = re.matches("reloaded/ua");
+		set resp.http.re-which   = re.which("reloaded/ua");
+	}
+} -start
+
+# --- Baseline: original file contents ---------------------------------------
+client c1 {
+	txreq -url "/"
+	rxresp
+	expect resp.http.cidr-count == "1"
+	expect resp.http.old-net    == "true"
+	expect resp.http.new-net    == "false"
+	expect resp.http.kv-count   == "1"
+	expect resp.http.kv-a       == "original"
+	expect resp.http.re-count   == "1"
+	expect resp.http.re-old     == "true"
+	expect resp.http.re-new     == "false"
+} -run
+
+# --- Add a runtime-only KV entry, then rewrite both files --------------------
+varnish v1 -cliok "vcl.list"
+
+shell {
+	printf '%s\n' '10.0.0.0/8' '172.16.0.0/12' '2001:db8::/32' > ${tmpdir}/reload.cidrs
+	printf '%s\n' 'a=reloaded' 'b=second' > ${tmpdir}/reload.kv
+	printf '%s\n' '^reloaded/' 'second$' > ${tmpdir}/reload.re
+}
+
+# Contents are still the old ones until reload() is called.
+client c2 {
+	txreq -url "/"
+	rxresp
+	expect resp.http.cidr-count == "1"
+	expect resp.http.new-net    == "false"
+	expect resp.http.kv-a       == "original"
+	expect resp.http.re-count   == "1"
+	expect resp.http.re-new     == "false"
+} -run
+
+client c3 {
+	txreq -url "/reload"
+	rxresp
+	expect resp.http.cidr-reloaded == "true"
+	expect resp.http.kv-reloaded   == "true"
+	expect resp.http.re-reloaded   == "true"
+
+	# The swap is visible immediately, in the same task.
+	expect resp.http.cidr-count == "3"
+	expect resp.http.old-net    == "false"
+	expect resp.http.new-net    == "true"
+	expect resp.http.kv-count   == "2"
+	expect resp.http.kv-a       == "reloaded"
+	expect resp.http.kv-b       == "second"
+	expect resp.http.re-count   == "2"
+	expect resp.http.re-old     == "false"
+	expect resp.http.re-new     == "true"
+	expect resp.http.re-which   == "^reloaded/"
+} -run
+
+# ... and to subsequent requests.
+client c4 {
+	txreq -url "/"
+	rxresp
+	expect resp.http.cidr-count == "3"
+	expect resp.http.new-net    == "true"
+	expect resp.http.kv-a       == "reloaded"
+	expect resp.http.re-new     == "true"
+} -run
+
+# --- A broken file must not disturb what is already serving -----------------
+shell {
+	printf '%s\n' '10.0.0.0/8' 'garbage-not-a-cidr' > ${tmpdir}/reload.cidrs
+	printf '%s\n' 'a=x' 'line without separator' > ${tmpdir}/reload.kv
+	printf '%s\n' '^ok' '[unclosed' > ${tmpdir}/reload.re
+}
+
+client c5 {
+	txreq -url "/reload"
+	rxresp
+	expect resp.http.cidr-reloaded == "false"
+	expect resp.http.kv-reloaded   == "false"
+	expect resp.http.re-reloaded   == "false"
+
+	# Previous contents still in place.
+	expect resp.http.cidr-count == "3"
+	expect resp.http.new-net    == "true"
+	expect resp.http.kv-count   == "2"
+	expect resp.http.kv-a       == "reloaded"
+	expect resp.http.re-count   == "2"
+	expect resp.http.re-new     == "true"
+} -run
+
+# The failure is reported on the Error tag, not swallowed.
+logexpect l1 -v v1 -d 1 -g raw {
+	expect * * Error "reload failed, keeping previous set"
+} -run
+
+# --- A deleted file is also a failed reload, not a crash --------------------
+shell {
+	rm -f ${tmpdir}/reload.cidrs ${tmpdir}/reload.kv ${tmpdir}/reload.re
+}
+
+client c6 {
+	txreq -url "/reload"
+	rxresp
+	expect resp.http.cidr-reloaded == "false"
+	expect resp.http.kv-reloaded   == "false"
+	expect resp.http.re-reloaded   == "false"
+	expect resp.http.cidr-count    == "3"
+	expect resp.http.kv-a          == "reloaded"
+	expect resp.http.re-count      == "2"
+	expect resp.http.re-new        == "true"
+} -run

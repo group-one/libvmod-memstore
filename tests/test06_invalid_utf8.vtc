@@ -1,0 +1,126 @@
+varnishtest "memstore: bytes that are not valid UTF-8 must not fail the request"
+
+# RFC 9110 permits obs-text (%x80-FF) in a field value, and a request target can carry
+# raw high bytes too. Both are fully client-controlled, so neither may turn into a 503.
+
+shell {
+	printf '%s\n' '^curl/' 'Googlebot' > ${tmpdir}/bots.re
+	printf '%s\n' '/old = /new' > ${tmpdir}/r.kv
+	printf '%s\n' '10.0.0.0/8' > ${tmpdir}/t.cidrs
+}
+
+varnish v1 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		new bots      = memstore.regex_set("${tmpdir}/bots.re");
+		new redirects = memstore.kv_store("${tmpdir}/r.kv");
+		new trusted   = memstore.cidr_set("${tmpdir}/t.cidrs");
+	}
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.re-match  = bots.matches(req.http.User-Agent);
+		set resp.http.re-which  = bots.which(req.http.User-Agent);
+		set resp.http.kv-exists = redirects.exists(req.url);
+		set resp.http.kv-get    = redirects.get(req.url);
+		set resp.http.cidr      = trusted.contains_str(req.http.X-Real-IP);
+	}
+} -start
+
+# Varnish appends client.ip to X-Forwarded-For, so use a header it leaves alone.
+
+# --- Baseline: plain ASCII ---------------------------------------------------
+client c1 {
+	txreq -url "/old" -hdr "User-Agent: curl/8.5.0" -hdr "X-Real-IP: 10.1.2.3"
+	rxresp
+	expect resp.status      == 200
+	expect resp.http.re-match  == "true"
+	expect resp.http.re-which  == "^curl/"
+	expect resp.http.kv-exists == "true"
+	expect resp.http.kv-get    == "/new"
+	expect resp.http.cidr      == "true"
+} -run
+
+# --- Valid UTF-8, non-ASCII: a CJK app name, as real mobile SDKs send --------
+client c2 {
+	txreq -url "/old" -hdr "User-Agent: \xe6\x90\x9c\xe7\x8b\x97/2.1 Googlebot/2.1"
+	rxresp
+	expect resp.status         == 200
+	# The multi-byte characters pass through and the ASCII run still matches.
+	expect resp.http.re-match  == "true"
+	expect resp.http.re-which  == "Googlebot"
+	expect resp.http.kv-get    == "/new"
+} -run
+
+# --- Invalid UTF-8 in every string argument: a miss, never a failure ---------
+client c3 {
+	txreq -url "/bad\xff" \
+		-hdr "User-Agent: Mozilla/5.0 \xff\xfe bad" \
+		-hdr "X-Real-IP: 10.1.2.3\xff"
+	rxresp
+	expect resp.status         == 200
+	expect resp.http.re-match  == "false"
+	expect resp.http.re-which  == ""
+	expect resp.http.kv-exists == "false"
+	expect resp.http.kv-get    == ""
+	# Not a parseable address, so not trusted -- the safe direction.
+	expect resp.http.cidr      == "false"
+} -run
+
+# --- A pattern can still match the ASCII run either side of a bad byte -------
+client c4 {
+	txreq -url "/old" -hdr "User-Agent: \xff Googlebot/2.1"
+	rxresp
+	expect resp.status        == 200
+	expect resp.http.re-match == "true"
+	expect resp.http.re-which == "Googlebot"
+} -run
+
+# ---------------------------------------------------------------------------
+# A stored key behaves as its lossy form, so the same bytes reach the same
+# entry on the way back in.
+# ---------------------------------------------------------------------------
+
+varnish v2 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		new kv = memstore.kv_store("${tmpdir}/r.kv");
+	}
+
+	sub vcl_recv {
+		if (req.url ~ "^/write") {
+			set req.http.stored = kv.set(req.http.K, "round-tripped");
+		}
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.stored = req.http.stored;
+		set resp.http.back   = kv.get(req.http.K);
+		set resp.http.count  = kv.count();
+	}
+} -start
+
+client c5 -connect ${v2_sock} {
+	txreq -url "/write" -hdr "K: key-\xff-suffix"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.back == "round-tripped"
+} -run
+
+client c6 -connect ${v2_sock} {
+	txreq -url "/read" -hdr "K: key-\xff-suffix"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.back  == "round-tripped"
+	expect resp.http.count == "2"
+} -run
