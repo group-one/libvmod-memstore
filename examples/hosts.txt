@@ -1,0 +1,5 @@
+# Example key/value file using a non-default separator, loaded with
+#   new hosts = memstore.kv_store("/etc/varnish/hosts.txt", ":");
+www.example.com:backend-a
+api.example.com:backend-b
+static.example.com:backend-cdn

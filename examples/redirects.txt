@@ -1,0 +1,13 @@
+# Example key/value file for memstore.kv_store()
+#
+# One `key = value` pair per line. Only the first separator splits the line,
+# so values may contain it. Keys and values are trimmed.
+# Blank lines are ignored, and `#` starts a comment only at the start of a line.
+
+/old-page       = /new-page
+/blog           = https://blog.example.com/
+/docs           = https://docs.example.com/index.html?utm_source=redirect
+
+# An empty value is a present key with an empty value; use exists() to tell
+# it apart from a missing key.
+/placeholder    =
