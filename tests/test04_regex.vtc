@@ -1,0 +1,168 @@
+varnishtest "memstore.regex_set: file loading, matching, case folding, multiple instances"
+
+shell {
+	printf '%s\n' \
+		'# crawler signatures' \
+		'^curl/' \
+		'(?:Googlebot|bingbot)/' \
+		'' \
+		'# a "#" only starts a comment at the beginning of a line' \
+		'\#fragment-\d+' \
+		> ${tmpdir}/bots.re
+
+	printf '%s\n' \
+		'^/admin\b' \
+		'\.php$' \
+		> ${tmpdir}/blocked.re
+
+	printf '%s\n' \
+		'googlebot' \
+		> ${tmpdir}/fold.re
+}
+
+varnish v1 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		# Three independent instances, to show the objects do not share state.
+		new bots    = memstore.regex_set("${tmpdir}/bots.re");
+		new blocked = memstore.regex_set("${tmpdir}/blocked.re");
+		new fold    = memstore.regex_set("${tmpdir}/fold.re", case_insensitive = true);
+	}
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.bots-count    = bots.count();
+		set resp.http.blocked-count = blocked.count();
+
+		# Blank lines and the leading-# comment lines are not patterns.
+		set resp.http.hit-curl      = bots.matches("curl/8.5.0");
+		set resp.http.hit-google    = bots.matches("Mozilla/5.0 (compatible; Googlebot/2.1)");
+		set resp.http.miss          = bots.matches("Mozilla/5.0 (X11; Linux x86_64)");
+		# '#' survives inside a pattern.
+		set resp.http.hit-fragment  = bots.matches("/docs#fragment-12");
+
+		# Matching is unanchored, like VCL's `~`; anchors still work.
+		set resp.http.unanchored    = blocked.matches("/x/index.php");
+		set resp.http.anchored-no   = blocked.matches("/x/admin/");
+		set resp.http.anchored-yes  = blocked.matches("/admin/login");
+
+		# An unset argument is a miss, not an error.
+		set resp.http.unset-arg     = bots.matches(req.http.No-Such-Header);
+
+		# Independent instances do not see each other's patterns.
+		set resp.http.cross         = blocked.matches("curl/8.5.0");
+
+		# case_insensitive is per instance ...
+		set resp.http.fold-yes      = fold.matches("GoogleBot/2.1");
+		set resp.http.fold-no       = bots.matches("GOOGLEBOT/2.1");
+		set resp.http.fold-exact    = fold.matches("googlebot");
+
+		set resp.http.path          = bots.path();
+	}
+} -start
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.bots-count    == "3"
+	expect resp.http.blocked-count == "2"
+
+	expect resp.http.hit-curl     == "true"
+	expect resp.http.hit-google   == "true"
+	expect resp.http.miss         == "false"
+	expect resp.http.hit-fragment == "true"
+
+	expect resp.http.unanchored   == "true"
+	expect resp.http.anchored-no  == "false"
+	expect resp.http.anchored-yes == "true"
+
+	expect resp.http.unset-arg    == "false"
+	expect resp.http.cross        == "false"
+
+	expect resp.http.fold-yes     == "true"
+	expect resp.http.fold-no      == "false"
+	expect resp.http.fold-exact   == "true"
+
+	expect resp.http.path         ~ "bots.re$"
+} -run
+
+# ---------------------------------------------------------------------------
+# which() / which_all(): report *which* pattern fired, for logging and routing
+# ---------------------------------------------------------------------------
+
+shell {
+	printf '%s\n' \
+		'Chrome/' \
+		'Safari/' \
+		'AppleWebKit/' \
+		'^curl/' \
+		> ${tmpdir}/ua.re
+}
+
+varnish v2 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		new ua = memstore.regex_set("${tmpdir}/ua.re");
+	}
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		# Three of the four patterns match; file order decides which is "first".
+		set resp.http.which      = ua.which(req.http.User-Agent);
+		set resp.http.which-all  = ua.which_all(req.http.User-Agent);
+		set resp.http.which-sep  = ua.which_all(req.http.User-Agent, " | ");
+
+		set resp.http.which-miss     = ua.which("wget/1.21");
+		set resp.http.which-all-miss = ua.which_all("wget/1.21");
+
+		set resp.http.which-unset    = ua.which(req.http.No-Such-Header);
+	}
+} -start
+
+client c2 -connect ${v2_sock} {
+	txreq -hdr "User-Agent: Mozilla/5.0 AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+	rxresp
+	expect resp.http.which     == "Chrome/"
+	expect resp.http.which-all == "Chrome/,Safari/,AppleWebKit/"
+	expect resp.http.which-sep == "Chrome/ | Safari/ | AppleWebKit/"
+
+	expect resp.http.which-miss     == ""
+	expect resp.http.which-all-miss == ""
+	expect resp.http.which-unset    == ""
+} -run
+
+# ---------------------------------------------------------------------------
+# A pattern that does not compile must fail vcl.load, naming the line.
+# ---------------------------------------------------------------------------
+
+shell {
+	printf '%s\n' '^/ok' '[unclosed' > ${tmpdir}/broken.re
+}
+
+varnish v1 -errvcl "line 2: invalid pattern" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.regex_set("${tmpdir}/broken.re");
+	}
+}
+
+varnish v1 -errvcl "cannot read" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new missing = memstore.regex_set("${tmpdir}/no-such-file.re");
+	}
+}

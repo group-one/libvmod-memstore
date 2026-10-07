@@ -1,0 +1,177 @@
+varnishtest "memstore.kv_store: file loading, mutation, custom separator"
+
+shell {
+	printf '%s\n' \
+		'# redirect table' \
+		'/old            = /new' \
+		'/blog           = https://blog.example.com/' \
+		'empty           =' \
+		'url             = https://example.com/?a=1&b=2' \
+		'color           = #ff0000' \
+		> ${tmpdir}/redirects.txt
+
+	printf '%s\n' \
+		'alpha:one' \
+		'beta:two' \
+		> ${tmpdir}/colon.txt
+}
+
+varnish v1 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		new redirects = memstore.kv_store("${tmpdir}/redirects.txt");
+		# Second instance, with a non-default separator.
+		new colon = memstore.kv_store("${tmpdir}/colon.txt", ":");
+	}
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.count      = redirects.count();
+		set resp.http.hit        = redirects.get("/old");
+		set resp.http.miss       = redirects.get("/nope");
+		set resp.http.exists-yes = redirects.exists("/old");
+		set resp.http.exists-no  = redirects.exists("/nope");
+
+		# An empty value is present but empty; exists() tells it from a miss.
+		set resp.http.empty-val    = redirects.get("empty");
+		set resp.http.empty-exists = redirects.exists("empty");
+
+		# Only the first separator splits, so values may contain '='.
+		set resp.http.url        = redirects.get("url");
+		# '#' is only a comment at the start of a line.
+		set resp.http.color      = redirects.get("color");
+
+		set resp.http.fallback   = redirects.get_or("/nope", "default-value");
+		set resp.http.no-fallback = redirects.get_or("/old", "unused");
+
+		# Custom separator, independent instance.
+		set resp.http.colon-count = colon.count();
+		set resp.http.colon-alpha = colon.get("alpha");
+		set resp.http.colon-cross = colon.get("/old");
+
+		set resp.http.path       = redirects.path();
+	}
+} -start
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.count        == "5"
+	expect resp.http.hit          == "/new"
+	expect resp.http.miss         == ""
+	expect resp.http.exists-yes   == "true"
+	expect resp.http.exists-no    == "false"
+
+	expect resp.http.empty-val    == ""
+	expect resp.http.empty-exists == "true"
+
+	expect resp.http.url          == "https://example.com/?a=1&b=2"
+	expect resp.http.color        == "#ff0000"
+
+	expect resp.http.fallback     == "default-value"
+	expect resp.http.no-fallback  == "/new"
+
+	expect resp.http.colon-count  == "2"
+	expect resp.http.colon-alpha  == "one"
+	expect resp.http.colon-cross  == ""
+
+	expect resp.http.path         ~ "redirects.txt$"
+} -run
+
+# ---------------------------------------------------------------------------
+# Mutation: add / update / set / delete
+# ---------------------------------------------------------------------------
+
+varnish v2 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		new kv = memstore.kv_store("${tmpdir}/redirects.txt");
+	}
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		# add() refuses to clobber an existing key ...
+		set resp.http.add-existing = kv.add("/old", "clobbered");
+		set resp.http.after-add-existing = kv.get("/old");
+		# ... but inserts a new one.
+		set resp.http.add-new = kv.add("/fresh", "inserted");
+		set resp.http.after-add-new = kv.get("/fresh");
+
+		# update() is the mirror image: only writes when the key is present.
+		set resp.http.update-missing = kv.update("/absent", "nope");
+		set resp.http.absent-still-missing = kv.exists("/absent");
+		set resp.http.update-existing = kv.update("/old", "updated");
+		set resp.http.after-update = kv.get("/old");
+
+		# set() always writes, and reports whether it replaced something.
+		set resp.http.set-replaced = kv.set("/old", "set-again");
+		set resp.http.set-inserted = kv.set("/brand-new", "v");
+		set resp.http.after-set = kv.get("/old");
+
+		# delete() reports whether the key was there.
+		set resp.http.del-hit = kv.delete("/brand-new");
+		set resp.http.del-miss = kv.delete("/brand-new");
+		set resp.http.after-del = kv.exists("/brand-new");
+
+		set resp.http.final-count = kv.count();
+	}
+} -start
+
+client c2 -connect ${v2_sock} {
+	txreq
+	rxresp
+	expect resp.http.add-existing       == "false"
+	expect resp.http.after-add-existing == "/new"
+	expect resp.http.add-new            == "true"
+	expect resp.http.after-add-new      == "inserted"
+
+	expect resp.http.update-missing       == "false"
+	expect resp.http.absent-still-missing == "false"
+	expect resp.http.update-existing      == "true"
+	expect resp.http.after-update         == "updated"
+
+	expect resp.http.set-replaced == "true"
+	expect resp.http.set-inserted == "false"
+	expect resp.http.after-set    == "set-again"
+
+	expect resp.http.del-hit   == "true"
+	expect resp.http.del-miss  == "false"
+	expect resp.http.after-del == "false"
+
+	# 5 from file + /fresh (added), /brand-new added then deleted
+	expect resp.http.final-count == "6"
+} -run
+
+# A malformed file must fail vcl.load.
+shell {
+	printf '%s\n' 'a=1' 'this line has no separator' > ${tmpdir}/broken.kv
+}
+
+varnish v1 -errvcl "missing separator" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.kv_store("${tmpdir}/broken.kv");
+	}
+}
+
+# A missing file is a load-time failure too, not a silently empty store.
+varnish v1 -errvcl "cannot read" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new missing = memstore.kv_store("${tmpdir}/no-such-file.kv");
+	}
+}

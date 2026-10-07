@@ -1,0 +1,123 @@
+varnishtest "memstore.cidr_set: file loading, IPv4/IPv6 lookups, multiple instances"
+
+shell {
+	printf '%s\n' \
+		'# trusted networks' \
+		'10.0.0.0/8' \
+		'192.168.1.0/24      // the office' \
+		'127.0.0.1' \
+		'' \
+		'2001:db8::/32' \
+		'::1' \
+		> ${tmpdir}/trusted.cidrs
+
+	printf '%s\n' \
+		'203.0.113.0/24' \
+		> ${tmpdir}/blocked.cidrs
+}
+
+varnish v1 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		# Two independent instances, to show the objects do not share state.
+		new trusted = memstore.cidr_set("${tmpdir}/trusted.cidrs");
+		new blocked = memstore.cidr_set("${tmpdir}/blocked.cidrs");
+	}
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.trusted-count = trusted.count();
+		set resp.http.blocked-count = blocked.count();
+
+		# IPv4
+		set resp.http.v4-inside     = trusted.contains_str("10.1.2.3");
+		set resp.http.v4-edge       = trusted.contains_str("10.255.255.255");
+		set resp.http.v4-outside    = trusted.contains_str("11.0.0.1");
+		set resp.http.v4-24-in      = trusted.contains_str("192.168.1.42");
+		set resp.http.v4-24-out     = trusted.contains_str("192.168.2.42");
+
+		# Bare address is a host route
+		set resp.http.v4-host-in    = trusted.contains_str("127.0.0.1");
+		set resp.http.v4-host-out   = trusted.contains_str("127.0.0.2");
+
+		# IPv6
+		set resp.http.v6-inside     = trusted.contains_str("2001:db8:dead:beef::1");
+		set resp.http.v6-outside    = trusted.contains_str("2001:db9::1");
+		set resp.http.v6-host-in    = trusted.contains_str("::1");
+
+		# IPv4-mapped IPv6 falls through to the IPv4 buckets
+		set resp.http.v4-mapped     = trusted.contains_str("::ffff:10.1.2.3");
+
+		# Garbage and unset arguments are false, not a VCL failure
+		set resp.http.garbage       = trusted.contains_str("not-an-ip");
+		set resp.http.unset-hdr     = trusted.contains_str(req.http.no-such-header);
+
+		# The real thing: varnishtest clients connect from 127.0.0.1
+		set resp.http.client-ip     = trusted.contains(client.ip);
+
+		# Instances are independent
+		set resp.http.cross-a       = blocked.contains_str("10.1.2.3");
+		set resp.http.cross-b       = blocked.contains_str("203.0.113.9");
+
+		set resp.http.path          = trusted.path();
+	}
+} -start
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.trusted-count == "5"
+	expect resp.http.blocked-count == "1"
+
+	expect resp.http.v4-inside   == "true"
+	expect resp.http.v4-edge     == "true"
+	expect resp.http.v4-outside  == "false"
+	expect resp.http.v4-24-in    == "true"
+	expect resp.http.v4-24-out   == "false"
+
+	expect resp.http.v4-host-in  == "true"
+	expect resp.http.v4-host-out == "false"
+
+	expect resp.http.v6-inside   == "true"
+	expect resp.http.v6-outside  == "false"
+	expect resp.http.v6-host-in  == "true"
+
+	expect resp.http.v4-mapped   == "true"
+
+	expect resp.http.garbage     == "false"
+	expect resp.http.unset-hdr   == "false"
+
+	expect resp.http.client-ip   == "true"
+
+	expect resp.http.cross-a     == "false"
+	expect resp.http.cross-b     == "true"
+
+	expect resp.http.path        ~ "trusted.cidrs$"
+} -run
+
+# A malformed file must fail vcl.load rather than surface at request time.
+shell {
+	printf '%s\n' '10.0.0.0/8' 'this-is-not-a-cidr' > ${tmpdir}/broken.cidrs
+}
+
+varnish v1 -errvcl "invalid IP address" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.cidr_set("${tmpdir}/broken.cidrs");
+	}
+}
+
+varnish v1 -errvcl "cannot read" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new missing = memstore.cidr_set("${tmpdir}/does-not-exist.cidrs");
+	}
+}
