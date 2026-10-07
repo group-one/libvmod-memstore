@@ -1,0 +1,320 @@
+//! The data model is the validated result of parsing user code.
+//! Once fully parsed and vetted, the data model is used to generate the Varnish VMOD code.
+
+// darling 0.24's `FromMeta` codegen for an `Option<T>` field emits a
+// `_darling::export::Option<T>` declaration in a module-level anonymous const,
+// which trips `unused_qualifications`; item-level `#[allow]` can't reach it.
+#![allow(unused_qualifications)]
+
+use std::iter::once;
+
+use darling::FromMeta;
+
+/// Represents the entire VMOD. A single instance of this struct is parsed for each VMOD.
+#[derive(Debug, Default)]
+pub struct VmodInfo {
+    pub params: VmodParams,
+    pub ident: String,
+    pub docs: String,
+    pub funcs: Vec<FuncInfo>,
+    pub objects: Vec<ObjInfo>,
+    pub shared_types: SharedTypes,
+}
+
+impl VmodInfo {
+    fn iter_all_funcs(&self) -> impl Iterator<Item = &FuncInfo> {
+        self.funcs.iter().chain(self.objects.iter().flat_map(|o| {
+            o.constructors
+                .iter()
+                .chain(o.funcs.iter())
+                .chain(once(&o.destructor))
+        }))
+    }
+
+    pub fn count_funcs<F: FnMut(&&FuncInfo) -> bool>(&self, filter: F) -> usize {
+        self.iter_all_funcs().filter(filter).count()
+    }
+
+    pub fn count_args<F: Copy + Fn(&&ParamTypeInfo) -> bool>(&self, filter: F) -> usize {
+        self.iter_all_funcs().map(|f| f.count_args(filter)).sum()
+    }
+}
+
+/// Represents the shared types used by multiple functions. Each of these types is unique per VMOD.
+#[derive(Debug, Default)]
+pub struct SharedTypes {
+    pub shared_per_task_ty: Option<String>,
+    pub shared_per_vcl_ty: Option<String>,
+}
+
+impl SharedTypes {
+    pub fn get_per_vcl_ty(&self) -> &str {
+        self.shared_per_vcl_ty.as_deref().unwrap_or("()")
+    }
+}
+
+/// Represents the parameters inside the `#[vmod(....)]` attribute itself.
+#[derive(Default, Debug, FromMeta)]
+#[darling(default)]
+pub struct VmodParams {
+    pub docs: Option<String>,
+}
+
+/// Represents the object information parsed from an `impl` block.
+#[derive(Debug)]
+pub struct ObjInfo {
+    pub ident: String,
+    pub docs: String,
+    pub constructors: Vec<FuncInfo>,
+    pub destructor: FuncInfo,
+    pub funcs: Vec<FuncInfo>,
+}
+
+/// Represents the function information parsed from a function or method.
+#[derive(Debug)]
+pub struct FuncInfo {
+    pub func_type: FuncType,
+    pub ident: String,
+    /// Overrides the VCL-visible name; `None` means use `ident`
+    pub vcl_name: Option<String>,
+    pub docs: String,
+    pub has_optional_args: bool,
+    pub args: Vec<ParamTypeInfo>,
+    pub output_ty: OutputTy,
+    pub out_result: bool,
+    pub restrict: Vec<String>,
+}
+
+impl FuncInfo {
+    pub fn count_args<F: Fn(&&ParamTypeInfo) -> bool>(&self, filter: F) -> usize {
+        self.args.iter().filter(filter).count()
+    }
+
+    pub fn vcl_ident(&self) -> &str {
+        self.vcl_name.as_deref().unwrap_or(&self.ident)
+    }
+}
+
+/// What kind of function is this?
+#[derive(Debug, Clone, Copy, Default)]
+pub enum FuncType {
+    #[default]
+    Function,
+    Constructor,
+    Destructor,
+    Method,
+    Event,
+}
+
+impl FuncType {
+    pub fn to_vcc_type(self) -> &'static str {
+        match self {
+            Self::Function => "$FUNC",
+            Self::Constructor => "$INIT",
+            Self::Destructor => "$FINI",
+            Self::Method => "$METHOD",
+            Self::Event => "$EVENT",
+        }
+    }
+}
+
+/// Represents the information about a single function argument.
+#[derive(Debug)]
+pub struct ParamTypeInfo {
+    pub ident: String,
+    pub docs: String,
+    pub ty: ParamType,
+}
+
+/// Represents the type of the function argument.
+#[derive(Debug, Clone)]
+pub enum ParamType {
+    /// An argument representing Varnish context (`VRT_CTX`) wrapper
+    Context { is_mut: bool },
+    /// An argument representing Varnish Workspace wrapper
+    Workspace { is_mut: bool },
+    /// For object methods, the first argument is always a reference to the object
+    SelfType,
+    /// An argument is an event type
+    Event,
+    /// A `&str` or `&CStr` argument automatically passed for object creation representing a VCL name.
+    VclName(ParamInfo),
+    /// An argument `&mut Option<Box<T>>` representing any Rust name and type shared across tasks (i.e. `PRIV_TASK`)
+    SharedPerTaskMut,
+    /// A readonly argument `Option<&T>` representing any Rust name and type shared across tasks (i.e. `PRIV_TASK`)
+    SharedPerTaskRef,
+    /// A reentrant argument `&RefCell<Option<T>>` for shared per-task state.
+    /// Unlike `SharedPerTaskMut`, the value stays in per-task storage during sub calls,
+    /// so nested VCL subroutine calls can also access it. Auto-initialized on first use.
+    SharedPerTaskRefCell,
+    /// A readonly argument `Option<&T>` representing any Rust name and type shared across VCL load (i.e. `PRIV_VCL`)
+    SharedPerVclRef,
+    /// A mutable argument `&mut Option<Box<T>>` representing any Rust name and type shared across VCL load (i.e. `PRIV_VCL`)
+    SharedPerVclMut,
+    /// An argument is a fetch filter registry
+    FetchFilters,
+    /// An argument is a delivery filter registry
+    DeliveryFilters,
+    /// An argument representing a basic VCL type
+    Value(ParamInfo),
+}
+
+#[derive(Debug, Clone)]
+pub enum ParamKind {
+    /// Type is declared without the `Option<...>`
+    Regular,
+    /// Type is declared with the `Option<...>`
+    Optional,
+    /// Type is declared with the `Option<...>`, but has a `#[required]` attribute.
+    /// This means it must be present when calling the function, but it could be `NULL`.
+    Required,
+}
+
+/// Represents the information about the common function argument types
+#[derive(Debug, Clone)]
+pub struct ParamInfo {
+    pub kind: ParamKind,
+    pub default: serde_json::Value,
+    pub ty_info: ParamTy,
+}
+
+/// Represents the common function argument types. These could also be returned.
+#[derive(Debug, Clone, Copy)]
+pub enum ParamTy {
+    Acl,
+    Bool,
+    BackendRef,
+    Blob,
+    Duration,
+    F64,
+    I64,
+    SystemTime,
+    Probe, // FIXME: can probes be returned?
+    ProbeCow,
+    SocketAddr,
+    Str,
+    CStr,
+    Sub,
+    VclType(&'static str),
+}
+
+impl ParamTy {
+    pub fn to_vcc_type(self) -> &'static str {
+        match self {
+            Self::Acl => "ACL",
+            Self::Bool => "BOOL",
+            Self::BackendRef => "BACKEND",
+            Self::Blob => "BLOB",
+            Self::Duration => "DURATION",
+            Self::F64 => "REAL",
+            Self::I64 => "INT",
+            Self::SystemTime => "TIME",
+            Self::Probe | Self::ProbeCow => "PROBE",
+            Self::SocketAddr => "IP",
+            Self::Str | Self::CStr => "STRING",
+            Self::Sub => "SUB",
+            Self::VclType(ty) => &ty[4..],
+        }
+    }
+
+    pub fn to_c_type(self) -> &'static str {
+        // ATTENTION: Each VCL_* type here must also be listed in the `use varnish::...`
+        //            statement in the `varnish-macros/src/generator.rs` file.
+        match self {
+            Self::Acl => "VCL_ACL",
+            Self::Bool => "VCL_BOOL",
+            Self::BackendRef => "VCL_BACKEND",
+            Self::Blob => "VCL_BLOB",
+            Self::Duration => "VCL_DURATION",
+            Self::F64 => "VCL_REAL",
+            Self::I64 => "VCL_INT",
+            Self::SystemTime => "VCL_TIME",
+            Self::Probe | Self::ProbeCow => "VCL_PROBE",
+            Self::SocketAddr => "VCL_IP",
+            Self::Str | Self::CStr => "VCL_STRING",
+            Self::Sub => "VCL_SUB",
+            Self::VclType(ty) => ty,
+        }
+    }
+
+    /// User MUST use some types with `Option`
+    pub fn must_be_optional(self) -> bool {
+        match self {
+            Self::Acl
+            | Self::Bool
+            | Self::Blob
+            | Self::CStr
+            | Self::Duration
+            | Self::F64
+            | Self::I64
+            | Self::SystemTime
+            | Self::Str
+            | Self::Sub
+            | Self::VclType(_) => false,
+            Self::BackendRef | Self::Probe | Self::ProbeCow | Self::SocketAddr => true,
+        }
+    }
+
+    /// Some VCL->Rust conversions require `TryFrom` instead of `From`,
+    /// e.g. if `&CStr` contains invalid UTF-8 characters and cannot be converted to `&str`.
+    pub fn use_try_from(self) -> bool {
+        match self {
+            Self::Acl
+            | Self::Bool
+            | Self::BackendRef
+            | Self::Blob
+            | Self::CStr
+            | Self::Duration
+            | Self::F64
+            | Self::I64
+            | Self::Probe
+            | Self::ProbeCow
+            | Self::SystemTime
+            | Self::SocketAddr
+            | Self::Sub
+            | Self::VclType(_) => false,
+            Self::Str => true,
+        }
+    }
+}
+
+/// Represents all return types of functions.
+#[derive(Debug, Clone)]
+pub enum OutputTy {
+    Default, // Nothing is returned
+    SelfType,
+    ParamType(ParamTy),
+    String,
+    VclType(String), // Raw VCL type, stored as original "VCL_..." string
+}
+
+impl OutputTy {
+    pub fn to_vcc_type(&self) -> String {
+        match self {
+            // Self is returned by obj constructors which are void in VCC
+            Self::Default | Self::SelfType => "VOID".into(),
+            Self::ParamType(ty) => ty.to_vcc_type().into(),
+            Self::String => "STRING".into(),
+            Self::VclType(ty) => ty[4..].to_string(), // remove "VCL_" prefix
+        }
+    }
+
+    pub fn to_c_type(&self) -> String {
+        // ATTENTION: Each VCL_* type here must also be listed in the `use varnish::...`
+        //            statement in the `varnish-macros/src/generator.rs` file.
+        match self {
+            Self::ParamType(ty) => ty.to_c_type().into(),
+            Self::String => "VCL_STRING".into(),
+            Self::SelfType | Self::Default => "VCL_VOID".into(),
+            Self::VclType(ty) => ty.into(),
+        }
+    }
+
+    pub fn requires_unsafe(&self) -> bool {
+        match self {
+            Self::VclType(_ty) => true,
+            Self::ParamType(ty) => matches!(ty, ParamTy::VclType(_)),
+            _ => false,
+        }
+    }
+}
