@@ -1,0 +1,21 @@
+# Example CIDR file for memstore.cidr_set()
+#
+# One entry per line: ADDRESS or ADDRESS/PREFIXLEN.
+# A bare address is a host route (/32 for IPv4, /128 for IPv6).
+# Blank lines are ignored; `#` and `//` start a comment.
+
+# RFC1918
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+
+# Loopback
+127.0.0.0/8
+::1
+
+# Documentation range           // trailing comments work too
+2001:db8::/32
+
+# Link-local
+169.254.0.0/16
+fe80::/10
