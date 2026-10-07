@@ -1,0 +1,27 @@
+[package]
+name = "varnish"
+authors = ["Guillaume Quintard <guillaume.quintard@gmail.com>", "Yuri Astrakhan <YuriAstrakhan@gmail.com>"]
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+version.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+ffi = []
+
+[dependencies]
+glob.workspace = true
+varnish-macros.workspace = true
+varnish-sys.workspace = true
+
+[dev-dependencies]
+trybuild.workspace = true
+
+[lints]
+workspace = true
