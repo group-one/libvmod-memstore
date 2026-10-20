@@ -41,7 +41,7 @@ pub enum PatternError {
 /// Deliberately not generic over the error type: there is one call site, and the two
 /// failures it adds of its own are [`PatternError`] variants, so a type parameter plus a
 /// `From` bound would buy nothing but ceremony.
-fn on_a_big_stack<T, F>(f: F) -> Result<T, PatternError>
+pub(crate) fn on_a_big_stack<T, F>(f: F) -> Result<T, PatternError>
 where
     F: FnOnce() -> Result<T, PatternError> + Send,
     T: Send,
