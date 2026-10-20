@@ -3,8 +3,9 @@
 all: build
 
 build:
-	cargo test --offline
-	cargo build --release --locked --offline
+	cargo build
+	cargo test
+	cargo build --release --locked
 
 vendor:
 	cargo vendor

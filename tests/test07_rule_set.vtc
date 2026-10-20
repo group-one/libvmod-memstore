@@ -1,0 +1,240 @@
+varnishtest "memstore.rule_set: VCL-declared fields, block file, per-request values, reload"
+
+shell {
+	printf '%s\n' \
+		'# Googlebot, API only' \
+		'ip:  66.249.64.0/19' \
+		'ua:  Googlebot' \
+		'url: ^/api/' \
+		'' \
+		'ip:  127.0.0.0/8' \
+		'ua:  bingbot' \
+		'' \
+		'ua:  Mozilla/5.0 \(compatible; SomeBot 1\.0\)' \
+		'url: ^/admin' \
+		> ${tmpdir}/access.rules
+
+	printf '%s\n' 'host: ^example\.com$' > ${tmpdir}/hosts.rules
+}
+
+varnish v1 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		new access = memstore.rule_set("${tmpdir}/access.rules");
+		access.field("ip",  "cidr");
+		access.field("ua",  "regex", case_insensitive = true);
+		access.field("url", "regex");
+		access.load();
+
+		# A second instance, to show the per-request values do not leak between them.
+		new hosts = memstore.rule_set("${tmpdir}/hosts.rules");
+		hosts.field("host", "regex");
+		hosts.load();
+	}
+
+	sub vcl_recv {
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.count = access.count();
+
+		# Nothing set yet: no rule can match.
+		set resp.http.before = access.matches();
+
+		set resp.http.set-ip  = access.set("ip",  client.ip);
+		set resp.http.set-ua  = access.set("ua",  req.http.User-Agent);
+		set resp.http.set-url = access.set("url", req.url);
+		set resp.http.matches = access.matches();
+		set resp.http.which   = access.which();
+
+		# The other instance has its own values.
+		set resp.http.hosts-before = hosts.matches();
+		hosts.set("host", req.http.Host);
+		set resp.http.hosts-after  = hosts.matches();
+
+		# Clearing a field with an unset value.
+		set resp.http.cleared = access.set("ua", req.http.No-Such-Header);
+		set resp.http.after-clear = access.matches();
+
+		# The SomeBot rule names no ip, and its value contains spaces.
+		access.set("ua",  "Mozilla/5.0 (compatible; SomeBot 1.0)");
+		access.set("url", "/admin/x");
+		set resp.http.somebot = access.which();
+
+		# Unparseable addresses and unknown fields are refused.
+		set resp.http.bad-ip  = access.set("ip", "not-an-ip");
+		set resp.http.unknown = access.set("nope", "x");
+
+		set resp.http.path = access.path();
+	}
+} -start
+
+logexpect l1 -v v1 -g raw {
+	expect * * Error {^memstore\.rule_set\(access\): unknown field "nope"}
+} -start
+
+client c1 {
+	txreq -url "/api/x" -hdr "Host: example.com" -hdr "User-Agent: BINGBOT/2.0"
+	rxresp
+	expect resp.http.count        == "3"
+	expect resp.http.before       == "false"
+	expect resp.http.set-ip       == "true"
+	expect resp.http.set-ua       == "true"
+	expect resp.http.set-url      == "true"
+	expect resp.http.matches      == "true"
+	expect resp.http.which        == "6"
+	expect resp.http.hosts-before == "false"
+	expect resp.http.hosts-after  == "true"
+	expect resp.http.cleared      == "false"
+	expect resp.http.after-clear  == "false"
+	expect resp.http.somebot      == "9"
+	expect resp.http.bad-ip       == "false"
+	expect resp.http.unknown      == "false"
+	expect resp.http.path         ~ "access.rules$"
+} -run
+
+logexpect l1 -wait
+
+# A Googlebot UA from a non-Google address does not match: the fields are paired.
+client c2 {
+	txreq -url "/api/x" -hdr "User-Agent: Googlebot/2.1"
+	rxresp
+	expect resp.http.matches == "false"
+	expect resp.http.which   == "0"
+} -run
+
+# ---------------------------------------------------------------------------
+# reload() keeps the fields and swaps the rules; a bad file keeps the old ones.
+# ---------------------------------------------------------------------------
+
+varnish v2 -vcl {
+	import memstore from "${vmod}";
+
+	backend be none;
+
+	sub vcl_init {
+		new r = memstore.rule_set("${tmpdir}/reload.rules", allow_missing = true);
+		r.field("ua", "regex");
+		r.load();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/reload") {
+			return (synth(200, "reload"));
+		}
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		if (resp.reason == "reload") {
+			set resp.http.reloaded = r.reload();
+		}
+		r.set("ua", req.http.User-Agent);
+		set resp.http.count   = r.count();
+		set resp.http.matches = r.matches();
+	}
+} -start
+
+client c3 -connect ${v2_sock} {
+	txreq -hdr "User-Agent: curl/8"
+	rxresp
+	expect resp.http.count   == "0"
+	expect resp.http.matches == "false"
+} -run
+
+shell { printf '%s\n' 'ua: ^curl/' > ${tmpdir}/reload.rules }
+
+client c4 -connect ${v2_sock} {
+	txreq -url "/reload" -hdr "User-Agent: curl/8"
+	rxresp
+	expect resp.http.reloaded == "true"
+	expect resp.http.count    == "1"
+	expect resp.http.matches  == "true"
+} -run
+
+shell { printf '%s\n' 'agent: ^curl/' > ${tmpdir}/reload.rules }
+
+client c5 -connect ${v2_sock} {
+	txreq -url "/reload" -hdr "User-Agent: curl/8"
+	rxresp
+	expect resp.http.reloaded == "false"
+	expect resp.http.matches  == "true"
+} -run
+
+# ---------------------------------------------------------------------------
+# Declaration and file errors fail vcl.load.
+# ---------------------------------------------------------------------------
+
+shell {
+	printf '%s\n' 'ip: 10.0.0.0/8' 'ua: [unclosed' > ${tmpdir}/broken.rules
+}
+
+varnish v1 -errvcl "line 2: invalid pattern" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.rule_set("${tmpdir}/broken.rules");
+		bad.field("ip", "cidr");
+		bad.field("ua", "regex");
+		bad.load();
+	}
+}
+
+varnish v1 -errvcl {unknown field type "ip"} {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.rule_set("${tmpdir}/access.rules");
+		bad.field("ip", "ip");
+	}
+}
+
+shell {
+	printf '%s\n' 'ip: 10.0.0.0/8' 'ua: a' '' 'ua: b' > ${tmpdir}/unpinned.rules
+}
+
+varnish v1 -errvcl {line 4: rule is missing required field "ip"} {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.rule_set("${tmpdir}/unpinned.rules");
+		bad.field("ip", "cidr", required = true);
+		bad.field("ua", "regex");
+		bad.load();
+	}
+}
+
+varnish v1 -errvcl "no fields defined" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new bad = memstore.rule_set("${tmpdir}/access.rules");
+		bad.load();
+	}
+}
+
+varnish v1 -errvcl "cannot read" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new missing = memstore.rule_set("${tmpdir}/no-such-file.rules");
+		missing.field("ua", "regex");
+		missing.load();
+	}
+}
+
+# field() and load() only exist in vcl_init.
+varnish v1 -errvcl "Not available in subroutine 'vcl_recv'" {
+	import memstore from "${vmod}";
+	backend be none;
+	sub vcl_init {
+		new r = memstore.rule_set("${tmpdir}/access.rules");
+	}
+	sub vcl_recv {
+		r.field("x", "regex");
+	}
+}

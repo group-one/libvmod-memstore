@@ -1,9 +1,9 @@
 [package]
 name = "vmod_memstore"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
-description = "Varnish VMOD providing CIDR sets, key/value stores and regex sets loaded from files"
+description = "Varnish VMOD providing CIDR sets, key/value stores, regex sets and rule sets loaded from files"
 license = "BSD-3-Clause"
 publish = false
 
@@ -29,6 +29,10 @@ harness = false
 
 [[bench]]
 name = "pattern"
+harness = false
+
+[[bench]]
+name = "rule"
 harness = false
 
 [profile.release]

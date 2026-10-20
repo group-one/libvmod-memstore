@@ -1,0 +1,12 @@
+# Fields: ip (cidr), ua (regex), url (regex) -- declared in VCL with field().
+
+# Googlebot, API only
+ip:  66.249.64.0/19
+ua:  Googlebot
+url: ^/api/
+
+ip:  157.55.39.0/24
+ua:  bingbot
+
+ua:  Mozilla/5.0 \(compatible; SomeBot 1\.0\)
+url: ^/admin

@@ -1,6 +1,6 @@
 # libvmod-memstore
 
-A [Varnish](https://github.com/varnish/varnish) VMOD, providing three
+A [Varnish](https://github.com/varnish/varnish) VMOD, providing four
 instantiable storage objects:
 
 | Object | Purpose |
@@ -8,8 +8,9 @@ instantiable storage objects:
 | `cidr_set` | A bucketed set of IPv4/IPv6 CIDR prefixes, loaded from a line-based file, with an IP-containment test and runtime reload. |
 | `kv_store` | A string key/value store, loaded from a line-based file, with add/update/delete and runtime reload. |
 | `regex_set` | A list of regular expressions, loaded from a line-based file, matched as one set, with runtime reload. |
+| `rule_set` | Rules over fields the VCL declares (CIDR or regex), loaded from a block-based file and matched against values set per request, with runtime reload. |
 
-All three are ordinary VCL objects, so a VCL can declare as many independent instances as
+All four are ordinary VCL objects, so a VCL can declare as many independent instances as
 it needs.
 
 The full, always-current VCL API reference is [`API.md`](API.md), generated from the source
@@ -26,6 +27,13 @@ sub vcl_init {
     # Returns an empty list if file is missing
     new redirects = memstore.kv_store("/etc/varnish/redirects.txt", allow_missing = true);
     new bots      = memstore.regex_set("/etc/varnish/bots.re", case_insensitive = true);
+
+    # Rules over fields you declare; each rule must match on every field it names.
+    new access = memstore.rule_set("/etc/varnish/access.rules");
+    access.field("ip",  "cidr");
+    access.field("ua",  "regex", case_insensitive = true);
+    access.field("url", "regex");
+    access.load();
 }
 
 sub vcl_recv {
@@ -42,6 +50,15 @@ sub vcl_recv {
     if (redirects.exists(req.url)) {
         set req.http.X-Redirect-To = redirects.get(req.url);
         return (synth(301, "Moved"));
+    }
+
+    access.set("ip",  client.ip);
+    access.set("ua",  req.http.User-Agent);
+    access.set("url", req.url);
+    if (access.matches()) {
+        # which() is the line the matching rule starts on.
+        std.log("access rule at line " + access.which());
+        return (synth(403, "Forbidden"));
     }
 }
 ```
@@ -92,4 +109,30 @@ so a significant leading or trailing space must be written `\s`, `[ ]` or `\x20`
 ^(?:curl|Wget)/
 (?:Googlebot|bingbot)/
 \.php$
+```
+
+### `rule_set`
+
+One rule per block of `field: value` lines; blank lines separate blocks. The field names
+are the ones the VCL declared with `field()`. Only the **first** `:` splits a line, so values
+may contain spaces, colons (IPv6) and `#`. Names and values are trimmed. `#` starts a
+comment only at the beginning of a line, and a comment does not end a block.
+
+A rule matches when every field it names matches the value given with `set()`. A field the
+block leaves out matches anything, including no value at all -- unless the field was
+declared with `required = true`, in which case every block must name it or the load fails.
+`cidr` values are prefixes as in `cidr_set`, and `regex` values are patterns as in
+`regex_set`. Escape regex metacharacters such as `(` `)` `.` when you mean them literally.
+
+```
+# Googlebot, API only
+ip:  66.249.64.0/19
+ua:  Googlebot
+url: ^/api/
+
+ip:  157.55.39.0/24
+ua:  bingbot
+
+ua:  Mozilla/5.0 \(compatible; SomeBot 1\.0\)
+url: ^/admin
 ```
