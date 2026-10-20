@@ -206,3 +206,95 @@ Number of patterns currently loaded.
 ### Method `STRING <object>.path()`
 
 The file this set was loaded from.
+
+## Object `rule_set`
+
+### Constructor `memstore.rule_set(STRING path, [BOOL allow_missing])`
+
+Create an empty rule set for `path`. Declare its fields with `field()`, then
+read the file with `load()` -- both in `vcl_init`.
+
+The file is block based: one rule per block of `field: value` lines, blocks
+separated by blank lines. Only the first `:` splits a line, so values may
+contain spaces, colons and `#`. A line whose first non-space character is `#`
+is a comment. A rule matches when every field it names matches; a field it
+leaves out matches anything.
+
+```vcl
+sub vcl_init {
+new access = memstore.rule_set("/etc/varnish/access.rules");
+access.field("ip",  "cidr", required = true);
+access.field("ua",  "regex", case_insensitive = true);
+access.field("url", "regex");
+access.load();
+}
+```
+
+### Method `VOID <object>.field(STRING name, STRING kind, [BOOL case_insensitive], [BOOL required])`
+
+Declare a field, in `vcl_init` before `load()`.
+
+`kind` is `"cidr"` (the rule value is a prefix, the request value an IP
+address) or `"regex"` (the rule value is a pattern, matched unanchored like
+`~`). `case_insensitive` defaults to `false` and only applies to `"regex"`.
+
+`required` defaults to `false`: a rule that leaves the field out matches any
+value for it. With `required = true`, every rule must name the field, and a
+rule that does not fails `load()` and `reload()`.
+
+Names may use letters, digits, `_`, `-` and `.`. A bad declaration fails
+`vcl.load`.
+
+### Method `VOID <object>.load()`
+
+Read and compile the file, in `vcl_init` after the `field()` calls.
+
+A bad line fails `vcl.load`, naming the line. So does a missing file, unless
+the constructor was given `allow_missing = true`: the set then starts empty
+and a later `reload()` picks the file up.
+
+### Method `BOOL <object>.set(STRING field, [STRING value])`
+
+Supply the value of `field` for this request, to be checked by `matches()`.
+
+Returns `true` if the value was stored. An unset argument, or an address that
+does not parse for a `"cidr"` field, clears the field instead and returns
+`false`: rules naming it then cannot match. An undeclared field name is a VCL
+bug, logged to VSL under `Error`.
+
+Values last for the rest of the task, and each `rule_set` keeps its own.
+
+```vcl
+access.set("ip",  client.ip);
+access.set("ua",  req.http.User-Agent);
+access.set("url", req.url);
+```
+
+### Method `BOOL <object>.matches()`
+
+Does any rule match the values supplied with `set()`?
+
+```vcl
+if (access.matches()) { return (synth(403)); }
+```
+
+### Method `INT <object>.which()`
+
+Line number where the first matching rule (in file order) starts, or `0` if
+none matches -- useful for logging *why* a request was classified.
+
+### Method `BOOL <object>.reload()`
+
+Re-read the file with the same fields and atomically swap the new rules in.
+
+Returns `true` on success. On failure the previous rules keep serving and the
+reason is logged to VSL under `Error`. Values already `set()` in the current
+request stay valid, because the fields cannot change.
+
+### Method `INT <object>.count()`
+
+Number of rules currently loaded.
+
+### Method `STRING <object>.path()`
+
+The file this set is loaded from.

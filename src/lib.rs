@@ -1,4 +1,4 @@
-//! `memstore` -- Varnish VMOD providing three instantiable storage objects:
+//! `memstore` -- Varnish VMOD providing four instantiable storage objects:
 //!
 //! * [`cidr_set`] -- a bucketed set of IPv4/IPv6 CIDR prefixes with an IP-containment
 //!   test, loaded from a line-based file and reloadable at runtime.
@@ -6,8 +6,10 @@
 //!   add/update/delete and reload.
 //! * [`regex_set`] -- a list of regular expressions loaded from a line-based file,
 //!   matched as one set, with reload.
+//! * [`rule_set`] -- rules over fields the VCL declares (CIDR or regex), each rule a
+//!   block of `field: value` lines, matched against values set per request, with reload.
 //!
-//! Both are ordinary VCL objects, so a VCL may declare as many independent instances
+//! All are ordinary VCL objects, so a VCL may declare as many independent instances
 //! as it needs.
 
 // The VCL object name comes from the Rust struct name and the VCL constructor name from
@@ -23,12 +25,14 @@ pub mod cidr;
 pub mod file;
 pub mod kv;
 pub mod pattern;
+pub mod rule;
 
 use std::borrow::Cow;
 use std::ffi::CStr;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
 /// A reloadable set of CIDR prefixes.
 ///
@@ -58,6 +62,29 @@ pub struct regex_set {
     /// Kept so a reload applies the same flag the constructor was given.
     case_insensitive: bool,
     set: ArcSwap<pattern::PatternSet>,
+}
+
+/// A reloadable set of multi-field rules. See [`rule`] for the format and matching.
+///
+/// Built in two steps, because VCL has no way to pass a variable list of field
+/// declarations to a constructor: `field()` collects the schema into `pending`, then
+/// `load()` freezes it into the first [`rule::RuleSet`]. From then on the schema travels
+/// with the set, so `reload()` and the per-request methods never touch the mutex.
+pub struct rule_set {
+    name: String,
+    path: PathBuf,
+    allow_missing: bool,
+    pending: Mutex<rule::Schema>,
+    /// `None` until `load()` has run.
+    set: ArcSwapOption<rule::RuleSet>,
+}
+
+impl rule_set {
+    /// Key for this object's values in the shared [`rule::TaskInputs`]. The object lives
+    /// at a fixed address for as long as its VCL is loaded.
+    fn owner(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
 }
 
 /// Text of a VCL string argument, with invalid UTF-8 replaced rather than rejected.
@@ -480,6 +507,215 @@ mod memstore {
         }
 
         /// The file this set was loaded from.
+        pub fn path(&self) -> String {
+            self.path.display().to_string()
+        }
+    }
+
+    impl rule_set {
+        /// Create an empty rule set for `path`. Declare its fields with `field()`, then
+        /// read the file with `load()` -- both in `vcl_init`.
+        ///
+        /// The file is block based: one rule per block of `field: value` lines, blocks
+        /// separated by blank lines. Only the first `:` splits a line, so values may
+        /// contain spaces, colons and `#`. A line whose first non-space character is `#`
+        /// is a comment. A rule matches when every field it names matches; a field it
+        /// leaves out matches anything.
+        ///
+        /// ```vcl
+        /// sub vcl_init {
+        ///     new access = memstore.rule_set("/etc/varnish/access.rules");
+        ///     access.field("ip",  "cidr", required = true);
+        ///     access.field("ua",  "regex", case_insensitive = true);
+        ///     access.field("url", "regex");
+        ///     access.load();
+        /// }
+        /// ```
+        pub fn rule_set(path: &str, allow_missing: Option<bool>, #[vcl_name] name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                path: PathBuf::from(path),
+                allow_missing: allow_missing.unwrap_or(false),
+                pending: Mutex::new(rule::Schema::default()),
+                set: ArcSwapOption::empty(),
+            }
+        }
+
+        /// Declare a field, in `vcl_init` before `load()`.
+        ///
+        /// `kind` is `"cidr"` (the rule value is a prefix, the request value an IP
+        /// address) or `"regex"` (the rule value is a pattern, matched unanchored like
+        /// `~`). `case_insensitive` defaults to `false` and only applies to `"regex"`.
+        ///
+        /// `required` defaults to `false`: a rule that leaves the field out matches any
+        /// value for it. With `required = true`, every rule must name the field, and a
+        /// rule that does not fails `load()` and `reload()`.
+        ///
+        /// Names may use letters, digits, `_`, `-` and `.`. A bad declaration fails
+        /// `vcl.load`.
+        #[restrict(vcl_init)]
+        pub fn field(
+            &self,
+            name: &str,
+            kind: &str,
+            case_insensitive: Option<bool>,
+            required: Option<bool>,
+        ) -> Result<(), VclError> {
+            if self.set.load().is_some() {
+                return Err(VclError::new(format!(
+                    "memstore.rule_set({}): field() must come before load()",
+                    self.name
+                )));
+            }
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add(
+                    name,
+                    kind,
+                    case_insensitive.unwrap_or(false),
+                    required.unwrap_or(false),
+                )
+                .map_err(|e| VclError::new(format!("memstore.rule_set({}): {e}", self.name)))
+        }
+
+        /// Read and compile the file, in `vcl_init` after the `field()` calls.
+        ///
+        /// A bad line fails `vcl.load`, naming the line. So does a missing file, unless
+        /// the constructor was given `allow_missing = true`: the set then starts empty
+        /// and a later `reload()` picks the file up.
+        #[restrict(vcl_init)]
+        pub fn load(&self, ctx: &mut Ctx) -> Result<(), VclError> {
+            if self.set.load().is_some() {
+                return Err(VclError::new(format!(
+                    "memstore.rule_set({}): load() called twice",
+                    self.name
+                )));
+            }
+            let schema = Arc::new(
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            );
+            let set = rule::RuleSet::from_file(&self.path, schema, self.allow_missing)
+                .map_err(|e| VclError::new(format!("memstore.rule_set({}): {e}", self.name)))?;
+            log_if_missing(ctx, "rule_set", &self.name, &self.path, set.is_empty());
+            self.set.store(Some(Arc::new(set)));
+            Ok(())
+        }
+
+        /// Supply the value of `field` for this request, to be checked by `matches()`.
+        ///
+        /// Returns `true` if the value was stored. An unset argument, or an address that
+        /// does not parse for a `"cidr"` field, clears the field instead and returns
+        /// `false`: rules naming it then cannot match. An undeclared field name is a VCL
+        /// bug, logged to VSL under `Error`.
+        ///
+        /// Values last for the rest of the task, and each `rule_set` keeps its own.
+        ///
+        /// ```vcl
+        /// access.set("ip",  client.ip);
+        /// access.set("ua",  req.http.User-Agent);
+        /// access.set("url", req.url);
+        /// ```
+        pub fn set(
+            &self,
+            ctx: &mut Ctx,
+            field: &str,
+            value: Option<&CStr>,
+            #[shared_per_task] inputs: &mut Option<Box<rule::TaskInputs>>,
+        ) -> bool {
+            let Some(set) = self.set.load_full() else {
+                ctx.log(
+                    LogTag::Error,
+                    format!("memstore.rule_set({}): set() before load()", self.name),
+                );
+                return false;
+            };
+            let schema = set.schema();
+            let Some(idx) = schema.index(field) else {
+                ctx.log(
+                    LogTag::Error,
+                    format!("memstore.rule_set({}): unknown field {field:?}", self.name),
+                );
+                return false;
+            };
+            let input = value.and_then(|v| schema.input(idx, v.to_bytes()));
+            let stored = input.is_some();
+            inputs
+                .get_or_insert_with(Default::default)
+                .slot_mut(self.owner(), schema.len())[idx] = input;
+            stored
+        }
+
+        /// Does any rule match the values supplied with `set()`?
+        ///
+        /// ```vcl
+        /// if (access.matches()) { return (synth(403)); }
+        /// ```
+        pub fn matches(&self, #[shared_per_task] inputs: Option<&rule::TaskInputs>) -> bool {
+            self.which(inputs) != 0
+        }
+
+        /// Line number where the first matching rule (in file order) starts, or `0` if
+        /// none matches -- useful for logging *why* a request was classified.
+        pub fn which(&self, #[shared_per_task] inputs: Option<&rule::TaskInputs>) -> i64 {
+            let Some(set) = self.set.load_full() else {
+                return 0;
+            };
+            let values = inputs.map_or(&[][..], |i| i.get(self.owner()));
+            set.first_match(values).map_or(0, |line| line as i64)
+        }
+
+        /// Re-read the file with the same fields and atomically swap the new rules in.
+        ///
+        /// Returns `true` on success. On failure the previous rules keep serving and the
+        /// reason is logged to VSL under `Error`. Values already `set()` in the current
+        /// request stay valid, because the fields cannot change.
+        pub fn reload(&self, ctx: &mut Ctx) -> bool {
+            let Some(current) = self.set.load_full() else {
+                ctx.log(
+                    LogTag::Error,
+                    format!("memstore.rule_set({}): reload() before load()", self.name),
+                );
+                return false;
+            };
+            // Not `allow_missing`: that only covers the cold start.
+            match rule::RuleSet::from_file(&self.path, current.schema().clone(), false) {
+                Ok(fresh) => {
+                    let count = fresh.len();
+                    self.set.store(Some(Arc::new(fresh)));
+                    ctx.log(
+                        LogTag::Debug,
+                        format!(
+                            "memstore.rule_set({}): reloaded {} rules from {}",
+                            self.name,
+                            count,
+                            self.path.display()
+                        ),
+                    );
+                    true
+                }
+                Err(e) => {
+                    ctx.log(
+                        LogTag::Error,
+                        format!(
+                            "memstore.rule_set({}): reload failed, keeping previous rules: {e}",
+                            self.name
+                        ),
+                    );
+                    false
+                }
+            }
+        }
+
+        /// Number of rules currently loaded.
+        pub fn count(&self) -> i64 {
+            self.set.load().as_ref().map_or(0, |s| s.len() as i64)
+        }
+
+        /// The file this set is loaded from.
         pub fn path(&self) -> String {
             self.path.display().to_string()
         }

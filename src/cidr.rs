@@ -25,7 +25,7 @@ pub struct CidrSet {
 
 /// Netmask for an IPv4 prefix length. `/0` is special-cased: shifting a `u32` by 32
 /// is undefined in Rust and panics in debug builds.
-fn mask4(prefix_len: u8) -> u32 {
+pub(crate) fn mask4(prefix_len: u8) -> u32 {
     if prefix_len == 0 {
         0
     } else {
@@ -34,7 +34,7 @@ fn mask4(prefix_len: u8) -> u32 {
 }
 
 /// Netmask for an IPv6 prefix length. See [`mask4`] for the `/0` case.
-fn mask6(prefix_len: u8) -> u128 {
+pub(crate) fn mask6(prefix_len: u8) -> u128 {
     if prefix_len == 0 {
         0
     } else {
